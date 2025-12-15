@@ -1,0 +1,8 @@
+ledger_path = "/var/xeris/ledger.dat"
+network_port = 4000
+explorer_port = 8081
+is_bootstrap = true
+bootstrap_ip = null
+keypair_path = "/etc/xeris/keypair.json"
+public_ip = "127.0.0.1"
+bootstrap_peers = ["bootstrap1.xeris.network:4001", "bootstrap2.xeris.network:4001"]
