@@ -26,3 +26,14 @@ Watch the INFO stream: "Received Block [N] from Seed..." signals active sync, "B
 Common hiccups are: "Insufficient balance" means airdrop still pending — verify submission and chain confirmation; "Address already in use" indicates stray processes — purge with `pkill xrs-node`. Stay current by `git pull` && rebuild on updates.
 
 Fire up your validator, and let’s fortify the XerisCoin testnet, and push the Triple Consensus envelope.
+
+
+Transaction Operations (Sending XRS)
+To transfer assets between wallets or return testnet funds, use the CLI send utility.
+
+Syntax:
+
+cargo run --release --bin send <RECIPIENT_PUBKEY> <AMOUNT>
+Example:
+ example cargo run --release --bin send 52qfRs478Ki1qrzrmtLziT7SHFk4TbMVSVZC2ewXA71k 50
+Note: Ensure your miner.json (or keypair.json) is in the root directory to sign the transaction.
