@@ -7,6 +7,9 @@ use tokio::runtime::Runtime;
 use crate::network::Network;
 use log::{info, error, warn};
 use prometheus::{Gauge, Registry};
+use std::path::Path; // Added for file check
+use std::fs::File;   // Added for file creation
+use std::io::Write;  // Added for writing keypair
 
 mod pow;
 mod poh;
@@ -67,7 +70,7 @@ impl Validator {
         let eligible_miners: Vec<(&String, &u64)> = ledger_guard.balances.iter()
             .filter(|(_, &bal)| bal >= 1_000_000_000_000) 
             .collect();
-            
+             
         let total_power: u64 = eligible_miners.iter().map(|(_, &bal)| bal).sum();
         if total_power == 0 { return self.keypair.pubkey(); }
 
@@ -166,25 +169,44 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let parts: Vec<String> = values.cloned().collect();
             let keypair = Keypair::try_from(serde_json::from_slice::<Vec<u8>>(&std::fs::read(&parts[0])?)?.as_slice())?;
             let treasury = keypair.pubkey();
-            
+             
             {
                 let mut l = ledger.lock().unwrap();
                 l.balances.insert(treasury.to_string(), 2_000 * 1_000_000_000); // Fair Launch Amount
             }
-            
+             
             let mut validator = Validator::new(keypair, ledger_clone.clone(), tx_pool.clone(), true);
             let net_fut = network::launch_all_network_services(ledger_clone.clone(), poh_recorder.clone(), tx_pool.clone());
-            
+             
             if let Err(e) = tokio::try_join!(validator.run(), explorer::start_explorer(ledger_clone.clone()), net_fut) {
                 error!("Crash: {}", e);
             }
         } else if let Some(values) = matches.get_many::<String>("validator") {
             let parts: Vec<String> = values.cloned().collect();
-            let keypair = Keypair::try_from(serde_json::from_slice::<Vec<u8>>(&std::fs::read(&parts[1])?)?.as_slice())?;
+            let keypair_path = &parts[1]; // Get the path (e.g., "miner.json")
+
+            // --- AUTO-KEY-GEN LOGIC START ---
+            let keypair = if Path::new(keypair_path).exists() {
+                // If file exists, load it
+                Keypair::try_from(serde_json::from_slice::<Vec<u8>>(&std::fs::read(keypair_path)?)?.as_slice())?
+            } else {
+                // If file is missing, create NEW unique wallet
+                println!("⭐ Miner file '{}' not found. Creating a NEW wallet...", keypair_path);
+                let new_key = Keypair::new();
+                let bytes = new_key.to_bytes().to_vec();
+                let json = serde_json::to_string(&bytes)?; // Save as JSON array
+                
+                let mut file = File::create(keypair_path)?;
+                file.write_all(json.as_bytes())?;
+                
+                println!("✅ New wallet saved to '{}'. BACK UP THIS FILE!", keypair_path);
+                new_key
+            };
+            // --- AUTO-KEY-GEN LOGIC END ---
 
             let mut validator = Validator::new(keypair, ledger_clone.clone(), tx_pool.clone(), false);
             let net_fut = network::launch_all_network_services(ledger_clone.clone(), poh_recorder.clone(), tx_pool.clone());
-            
+             
             if let Err(e) = tokio::try_join!(validator.run(), explorer::start_explorer(ledger_clone.clone()), net_fut) {
                 error!("Crash: {}", e);
             }

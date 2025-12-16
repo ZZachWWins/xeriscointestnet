@@ -29,6 +29,7 @@ spl-token = "4.0"
 bs58 = "0.5"
 futures = "0.3"
 tokio-stream = { version = "0.1.17", features = ["net"] }
+openssl = { version = "0.10", features = ["vendored"] }
 
 [[bin]]
 name = "xrs-node"
