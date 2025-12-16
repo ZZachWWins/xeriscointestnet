@@ -134,7 +134,10 @@ impl Validator {
                     Err(_) => { }
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+            // --- CRITICAL FIX: SLOW DOWN BLOCK PRODUCTION ---
+            // Changed from 400ms to 2000ms (2 seconds)
+            // This gives the Mac enough time to download blocks over the internet.
+            tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
         }
     }
 }

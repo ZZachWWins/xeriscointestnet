@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 use solana_sdk::{transaction::Transaction, signature::Signature, pubkey::Pubkey};
 use serde::{Serialize, Deserialize};
 use std::collections::HashMap;
-use log::{info, error, warn};
+use log::{info, error, warn, debug};
 use warp::Filter;
 use warp::http::Method; 
 use crate::ledger::{Ledger, Block};
@@ -17,10 +17,11 @@ use bincode;
 use crate::poh::PoHRecorder; 
 use std::error::Error;
 use crate::tx_pool::{PriorityQueue, PrioritizedTx};
+use tokio::time::{timeout, Duration};
 
 const MAGIC_BYTES: &[u8; 4] = b"XRS1";
-const MAX_MSG_SIZE: usize = 10 * 1024 * 1024; 
-const DNS_SEED_URL: &str = "https://gist.githubusercontent.com/ZZachWWins/d876c15d6dd0a57858046ba4e36a91d8/raw/4e6bbef4d236a8b6c5704d1ef302d8fc51e56a34/peers.txt";
+const MAX_MSG_SIZE: usize = 10 * 1024 * 1024; // 10MB Limit
+const DNS_SEED_URL: &str = "https://gist.githubusercontent.com/ZZachWWins/d876c15d6dd0a57858046ba4e36a91d8/raw/peers.txt";
 
 #[derive(Serialize, Deserialize, Debug)]
 pub enum NetworkMessage { 
@@ -29,6 +30,31 @@ pub enum NetworkMessage {
     AuthRequest(Signature, String), 
     GetBlocks(u64), 
 }
+
+// --- FRAMING HELPER FUNCTIONS ---
+async fn send_message(stream: &mut TcpStream, msg: &NetworkMessage) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let bytes = bincode::serialize(msg)?;
+    let len = bytes.len() as u32;
+    stream.write_all(&len.to_be_bytes()).await?; 
+    stream.write_all(&bytes).await?;             
+    Ok(())
+}
+
+async fn recv_message(stream: &mut TcpStream) -> Result<NetworkMessage, Box<dyn Error + Send + Sync>> {
+    let mut len_buf = [0u8; 4];
+    stream.read_exact(&mut len_buf).await?;      
+    let len = u32::from_be_bytes(len_buf) as usize;
+
+    if len > MAX_MSG_SIZE {
+        return Err("Message too large".into());
+    }
+
+    let mut buf = vec![0u8; len];
+    stream.read_exact(&mut buf).await?;          
+    let msg = bincode::deserialize(&buf)?;
+    Ok(msg)
+}
+// ------------------------------------------------
 
 #[derive(Serialize, Deserialize)]
 struct SubmitTransactionRequest { tx_base64: String }
@@ -46,7 +72,8 @@ pub struct Network {
     pub last_connection: HashMap<String, Instant>,
     pub ledger: Arc<Mutex<Ledger>>,
     pub seed_peers: Vec<String>, 
-    pub poh_recorder: PoHRecorder, 
+    pub poh_recorder: PoHRecorder,
+    pub highest_seen_slot: Arc<Mutex<u64>>, // NEW: Tracks the true network height
 }
 
 impl Network {
@@ -57,12 +84,13 @@ impl Network {
             authenticated_nodes: HashMap::new(), last_connection: HashMap::new(),
             ledger, 
             seed_peers: vec![], 
-            poh_recorder: poh, 
+            poh_recorder: poh,
+            highest_seen_slot: Arc::new(Mutex::new(0)),
         }
     }
     
     pub fn fetch_seeds(&mut self) {
-        info!("Fetching peers from DNS Seed: {}", DNS_SEED_URL);
+        info!("Fetching peers from DNS Seed...");
         match reqwest::blocking::get(DNS_SEED_URL) {
             Ok(resp) => {
                 if let Ok(text) = resp.text() {
@@ -70,83 +98,107 @@ impl Network {
                         .map(|line| line.trim().to_string())
                         .filter(|line| !line.is_empty())
                         .collect();
-                    info!("Found {} peers from DNS.", peers.len());
                     self.seed_peers = peers;
                 }
             },
-            Err(e) => warn!("Failed to fetch DNS seeds (offline?): {}", e),
+            Err(e) => warn!("Failed to fetch DNS seeds: {}", e),
         }
     }
 
     pub fn broadcast_transaction(&mut self, tx: &Transaction) {
         let pool = self.tx_pool.lock().unwrap();
         if pool.len() < 10_000 {
-            info!("Gulf Stream: Forwarded tx {:?}", tx.signatures.get(0).unwrap_or(&Signature::default()));
+            debug!("Forwarded tx {:?}", tx.signatures.get(0).unwrap_or(&Signature::default()));
         }
     }
 
+    // --- THE "REALITY CHECK" FUNCTION ---
     pub fn broadcast_block(&mut self, block: Block) {
-        let mut l = self.ledger.lock().unwrap();
-        if let Ok(_) = l.add_block(block.clone()) {
-            info!("Broadcasting block {} from {}", block.slot, block.proposer);
+        let network_height = *self.highest_seen_slot.lock().unwrap();
+        
+        // If we are trying to broadcast block 1800, but we've seen block 6700...
+        // We are WAY behind. Stop the madness.
+        if block.slot < network_height.saturating_sub(10) {
+            warn!("🛑 BLOCKED Ghost Mining! Local: {}, Network: {}. Reverting...", block.slot, network_height);
+            
+            // 1. Do NOT send the block to peers.
+            // 2. Delete the bad block locally so we can sync the real one.
+            let mut l = self.ledger.lock().unwrap();
+            l.rollback();
+            return;
         }
+
+        // If we are close to the tip, proceed as normal.
+        debug!("Broadcasting block {}", block.slot);
     }
 
     pub fn connect_to_seeds(&self, peers: &[String]) {
         for peer in peers {
             let peer_addr = peer.clone();
             let ledger = self.ledger.clone();
-            info!("Attempting to connect to seed peer: {}", peer_addr);
+            let highest_slot_tracker = self.highest_seen_slot.clone();
             
             tokio::spawn(async move {
-                match TcpStream::connect(&peer_addr).await {
-                    Ok(mut stream) => {
-                        info!("Connected to seed: {}", peer_addr);
-                        
-                        let hello = NetworkMessage::AuthRequest(Signature::default(), "V1-Node".to_string());
-                        let serialized = bincode::serialize(&hello).unwrap();
-                        if let Err(_) = stream.write_all(MAGIC_BYTES).await { return; }
-                        if let Err(_) = stream.write_all(&serialized).await { return; }
+                let mut loop_counter: u64 = 0;
+                loop { 
+                    info!("Connecting to Seed: {}", peer_addr);
+                    
+                    match TcpStream::connect(&peer_addr).await {
+                        Ok(mut stream) => {
+                            info!("✅ Connected to {}", peer_addr);
+                            
+                            // Handshake
+                            let hello = NetworkMessage::AuthRequest(Signature::default(), "V1-Node".to_string());
+                            if stream.write_all(MAGIC_BYTES).await.is_err() { 
+                                tokio::time::sleep(Duration::from_secs(5)).await; continue; 
+                            }
+                            if send_message(&mut stream, &hello).await.is_err() { 
+                                tokio::time::sleep(Duration::from_secs(5)).await; continue; 
+                            }
 
-                        // TCP Fix 1: Sleep after handshake
-                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                            loop {
+                                loop_counter += 1;
+                                let (my_slot, my_hash) = {
+                                    let l = ledger.lock().unwrap();
+                                    l.get_last_block().map(|b| (b.slot, b.hash.clone())).unwrap_or((0, vec![]))
+                                };
 
-                        info!("🚀 Requesting full blockchain sync from seed...");
-                        let sync_req = NetworkMessage::GetBlocks(0);
-                        let sync_bytes = bincode::serialize(&sync_req).unwrap();
-                        if let Err(e) = stream.write_all(&sync_bytes).await {
-                             error!("Failed to send sync request: {}", e);
-                             return;
-                        }
+                                // A. Ask for NEW blocks
+                                let sync_req = NetworkMessage::GetBlocks(my_slot + 1);
+                                if let Err(_) = send_message(&mut stream, &sync_req).await {
+                                    warn!("Send failed. Reconnecting...");
+                                    break;
+                                }
 
-                        let mut buf = vec![0; MAX_MSG_SIZE]; 
-                        loop {
-                            match stream.read(&mut buf).await {
-                                Ok(0) => break,
-                                Ok(n) => {
-                                    if let Ok(msg) = bincode::deserialize::<NetworkMessage>(&buf[0..n]) {
+                                // B. Listen for response (20s Patience)
+                                match timeout(Duration::from_secs(20), recv_message(&mut stream)).await {
+                                    Ok(Ok(msg)) => {
                                         match msg {
                                             NetworkMessage::Block(b) => {
-                                                info!("Received Block {} from Seed", b.slot);
+                                                // UPDATE "REALITY" TRACKER
+                                                let mut h = highest_slot_tracker.lock().unwrap();
+                                                if b.slot > *h { *h = b.slot; }
+
+                                                if b.slot % 100 == 0 {
+                                                    info!("Received Block {} from Seed (Target: {})", b.slot, *h);
+                                                }
                                                 let mut l = ledger.lock().unwrap();
                                                 let _ = l.add_block(b);
                                             },
                                             _ => {}
                                         }
                                     }
+                                    Ok(Err(_)) => { warn!("Connection closed. Retry 5s..."); break; }
+                                    Err(_) => { continue; } // Timeout -> Keep waiting
                                 }
-                                Err(_) => break,
                             }
-                        }
-                    },
-                    Err(e) => warn!("Failed to connect to seed {}: {}", peer_addr, e)
+                        },
+                        Err(e) => { warn!("Failed to connect {}: {}", peer_addr, e); }
+                    }
+                    tokio::time::sleep(Duration::from_secs(5)).await;
                 }
             });
         }
-    }
-    
-    pub fn decrement_connection(&mut self, ip: &str) {
-        if let Some(count) = self.connections_per_ip.get_mut(ip) { *count = count.saturating_sub(1); }
     }
 }
 
@@ -159,9 +211,8 @@ pub struct NetworkRunData {
 pub async fn setup_network(ledger: Arc<Mutex<Ledger>>, poh: PoHRecorder, tx_pool: Arc<Mutex<PriorityQueue>>) -> Result<NetworkRunData, Box<dyn std::error::Error + Send + Sync>> {
     let tcp_addr: SocketAddr = "0.0.0.0:4000".parse().expect("Invalid TCP address");
     let listener = TcpListener::bind(tcp_addr).await.map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)?;
-    info!("P2P network listener bound to port 4000");
-
-    let semaphore = Arc::new(Semaphore::new(100));
+    
+    let semaphore = Arc::new(Semaphore::new(500)); 
     let network_state = Arc::new(Mutex::new(Network::new(
         tx_pool,
         Arc::new(Mutex::<Vec<Pubkey>>::new(vec![Pubkey::new_unique()])), 
@@ -178,7 +229,7 @@ pub async fn setup_network(ledger: Arc<Mutex<Ledger>>, poh: PoHRecorder, tx_pool
 
 pub async fn run_p2p_listener_core(run_data: NetworkRunData) -> Result<(), Box<dyn Error + Send + Sync>> {
     let NetworkRunData { listener, network_state: network, semaphore } = run_data;
-    info!("P2P network active, listening on 4000.");
+    info!("P2P High-Speed Listener active on 4000.");
     
     loop {
         let permit = match semaphore.clone().acquire_owned().await {
@@ -191,61 +242,56 @@ pub async fn run_p2p_listener_core(run_data: NetworkRunData) -> Result<(), Box<d
         };
         let ip = addr.ip().to_string();
         let network_inner = network.clone(); 
-        
+        let highest_slot_tracker = network_inner.lock().unwrap().highest_seen_slot.clone();
+
         tokio::spawn(async move {
             let _p = permit; 
-            let mut buf = vec![0; MAX_MSG_SIZE];
             let mut magic = [0u8; 4];
             
             if let Err(_) = stream.read_exact(&mut magic).await { return; }
             if &magic != MAGIC_BYTES { return; }
 
             loop {
-                let n = match stream.read(&mut buf).await { Ok(n) => n, Err(_) => return };
-                if n == 0 { return; }
+                match recv_message(&mut stream).await {
+                    Ok(msg) => {
+                        match msg {
+                            NetworkMessage::Block(block) => {
+                                // Update Reality Tracker on Receive
+                                let mut h = highest_slot_tracker.lock().unwrap();
+                                if block.slot > *h { *h = block.slot; }
 
-                if let Ok(msg) = bincode::deserialize::<NetworkMessage>(&buf[0..n]) {
-                    match msg {
-                        NetworkMessage::AuthRequest(_, _) => info!("Peer {} Handshake OK.", ip),
-                        
-                        NetworkMessage::Block(block) => {
-                            let ledger_arc = network_inner.lock().unwrap().ledger.clone();
-                            let mut ledger_guard = ledger_arc.lock().unwrap();
-                            let _ = ledger_guard.add_block(block);
-                        },
-                        
-                        NetworkMessage::Transaction(tx) => {
-                            if tx.verify().is_ok() {
-                                network_inner.lock().unwrap().broadcast_transaction(&tx);
-                            }
-                        },
-                        
-                        NetworkMessage::GetBlocks(start_index) => {
-                             info!("Peer {} requested sync from block {}", ip, start_index);
-                             
-                             let blocks_to_send: Vec<Block> = {
-                                 let ledger_arc = network_inner.lock().unwrap().ledger.clone();
-                                 let l = ledger_arc.lock().unwrap();
-                                 l.blocks.iter()
-                                    .skip(start_index as usize)
-                                    .cloned()
-                                    .collect()
-                             }; 
-
-                             info!("Sending {} blocks to peer {}", blocks_to_send.len(), ip);
-                             for b in blocks_to_send {
-                                 let resp = NetworkMessage::Block(b);
-                                 if let Ok(bytes) = bincode::serialize(&resp) {
-                                     if let Err(e) = stream.write_all(&bytes).await {
-                                         error!("Failed to push block to peer: {}", e);
-                                         break;
+                                let ledger_arc = network_inner.lock().unwrap().ledger.clone();
+                                let mut l = ledger_arc.lock().unwrap();
+                                let _ = l.add_block(block);
+                            },
+                            NetworkMessage::Transaction(tx) => {
+                                if tx.verify().is_ok() {
+                                    network_inner.lock().unwrap().broadcast_transaction(&tx);
+                                }
+                            },
+                            NetworkMessage::GetBlocks(start_index) => {
+                                 let blocks_to_send: Vec<Block> = {
+                                     let ledger_arc = network_inner.lock().unwrap().ledger.clone();
+                                     let l = ledger_arc.lock().unwrap();
+                                     if let Some(specific_block) = l.blocks.iter().find(|b| b.slot == start_index) {
+                                         vec![specific_block.clone()]
+                                     } else {
+                                         l.blocks.iter()
+                                            .skip(start_index as usize)
+                                            .take(500)
+                                            .cloned()
+                                            .collect()
                                      }
-                                     // TCP Fix 2: Sleep between blocks
-                                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                 }; 
+                                 for b in blocks_to_send {
+                                     let resp = NetworkMessage::Block(b);
+                                     if let Err(_) = send_message(&mut stream, &resp).await { break; }
                                  }
-                             }
+                            },
+                             _ => {}
                         }
-                    }
+                    },
+                    Err(_) => break, 
                 }
             }
         });
@@ -260,6 +306,7 @@ pub async fn run_rpc_server(
     let ledger_airdrop = ledger.clone();
     let ledger_getwork = ledger.clone();
     let ledger_stake = ledger.clone();
+    let ledger_blocks = ledger.clone(); 
     let tx_pool_submit = tx_pool.clone();
     let poh_clone = poh.clone();
     let http_addr: SocketAddr = "0.0.0.0:56001".parse().expect("Invalid HTTP address");
@@ -311,7 +358,13 @@ pub async fn run_rpc_server(
         }
     });
 
-    let routes = airdrop.or(getwork).or(submit).or(stake);
+    let blocks = warp::path("blocks").map(move || {
+        let l = ledger_blocks.lock().unwrap();
+        let recent: Vec<Block> = l.blocks.iter().rev().take(50).cloned().collect(); 
+        warp::reply::json(&recent)
+    });
+
+    let routes = airdrop.or(getwork).or(submit).or(stake).or(blocks);
     let cors = warp::cors().allow_any_origin().allow_methods(vec![Method::GET, Method::POST]).allow_header("content-type").build();
     
     info!("HTTP RPC server running on http://0.0.0.0:56001");

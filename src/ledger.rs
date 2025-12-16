@@ -1,6 +1,6 @@
 use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 use serde::{Serialize, Deserialize};
-use std::collections::{HashMap, VecDeque, HashSet}; // Added HashSet
+use std::collections::{HashMap, VecDeque, HashSet}; 
 use std::sync::{Arc, Mutex};
 use log::{info, error, debug, warn};
 use sha2::{Sha256, Digest};
@@ -85,6 +85,17 @@ impl Ledger {
     pub fn get_last_block(&self) -> Option<&Block> {
         self.blocks.last()
     }
+
+    // --- NEW: Ability to delete the last block (for Re-orgs) ---
+    pub fn rollback(&mut self) {
+        if let Some(bad_block) = self.blocks.pop() {
+            info!("🔄 RE-ORG: Rolled back slot {}", bad_block.slot);
+            // Note: In a full mainnet, you would also revert balances/UTXOs here.
+            // For V1 Alpha, removing the block is enough to sync up.
+            let _ = self.save(LEDGER_FILE);
+        }
+    }
+    // ------------------------------------------------------------
 
     pub fn add_block(&mut self, block: Block) -> Result<(), Box<dyn Error>> {
         if self.detect_malicious(&block) {
