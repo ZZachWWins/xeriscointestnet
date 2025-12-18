@@ -7,9 +7,9 @@ use tokio::runtime::Runtime;
 use crate::network::Network;
 use log::{info, error, warn};
 use prometheus::{Gauge, Registry};
-use std::path::Path; // Added for file check
-use std::fs::File;   // Added for file creation
-use std::io::Write;  // Added for writing keypair
+use std::path::Path; // Checking if file exists
+use std::fs::File;   // Creating new files
+use std::io::Write;  // Writing to files
 
 mod pow;
 mod poh;
@@ -202,7 +202,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("✅ New wallet saved to '{}'. BACK UP THIS FILE!", keypair_path);
                 new_key
             };
-            // --- AUTO-KEY-GEN LOGIC END ---
+            
+            // --- NEW: SAVE ADDRESS TO FILE (For Windows UX) ---
+            let my_address = keypair.pubkey().to_string();
+            // Just write the address string to "address.txt" next to the exe
+            if let Ok(mut file) = File::create("address.txt") {
+                let _ = file.write_all(my_address.as_bytes());
+                println!("📍 Address saved to 'address.txt'. Open this file to copy your address!");
+            }
+            // --------------------------------------------------
 
             let mut validator = Validator::new(keypair, ledger_clone.clone(), tx_pool.clone(), false);
             let net_fut = network::launch_all_network_services(ledger_clone.clone(), poh_recorder.clone(), tx_pool.clone());
