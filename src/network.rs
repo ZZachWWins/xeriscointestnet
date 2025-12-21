@@ -18,7 +18,7 @@ use tokio::time::{timeout, Duration};
 const MAGIC_BYTES: &[u8; 4] = b"XRS1";
 const MAX_MSG_SIZE: usize = 5 * 1024 * 1024; // Shield: 5MB DDoS Protection
 const MAX_PEERS: usize = 3000;              // Shield: Max active gossip connections
-const CONN_TIMEOUT: u64 = 45;               // Shield: Inactivity reaper (seconds)
+const CONN_TIMEOUT: u64 = 45;               // Shield: Kill inactive peers after 45s
 const DNS_SEED_URL: &str = "https://gist.githubusercontent.com/ZZachWWins/d876c15d6dd0a57858046ba4e36a91d8/raw/peers.txt";
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -189,7 +189,7 @@ pub struct NetworkRunData {
 pub async fn setup_network(ledger: Arc<Mutex<Ledger>>, poh: PoHRecorder, tx_pool: Arc<Mutex<PriorityQueue>>) -> Result<NetworkRunData, Box<dyn std::error::Error + Send + Sync>> {
     let tcp_addr: SocketAddr = "0.0.0.0:4000".parse().expect("Invalid TCP address");
     let listener = TcpListener::bind(tcp_addr).await?;
-    let semaphore = Arc::new(Semaphore::new(3000)); // Cap simultaneous connections
+    let semaphore = Arc::new(Semaphore::new(3000)); 
     let network_state = Arc::new(Mutex::new(Network::new(tx_pool, Arc::new(Mutex::new(vec![])), ledger, poh)));
     
     network_state.lock().unwrap().fetch_seeds();
@@ -225,13 +225,12 @@ pub async fn run_p2p_listener_core(run_data: NetworkRunData) -> Result<(), Box<d
             if &magic != MAGIC_BYTES { return; }
 
             loop {
-                // Connection Reaper: Kick silent peers to free up resources
                 match timeout(Duration::from_secs(CONN_TIMEOUT), recv_message(&mut stream)).await {
                     Ok(Ok(msg)) => match msg {
                         NetworkMessage::Transaction(tx) => {
                             if tx.verify().is_ok() {
                                 let net = network_inner.lock().unwrap();
-                                info!("📩 Received Transaction: Relaying to mesh");
+                                info!("📩 Received Transaction: Relay to network");
                                 net.tx_pool.lock().unwrap().push(PrioritizedTx { tx: tx.clone(), fee: 5000 });
                                 net.broadcast_transaction(tx); 
                             }
@@ -240,7 +239,7 @@ pub async fn run_p2p_listener_core(run_data: NetworkRunData) -> Result<(), Box<d
                             let net = network_inner.lock().unwrap();
                             let mut h = net.highest_seen_slot.lock().unwrap();
                             if block.slot > *h { 
-                                info!("📦 RECEIVED BLOCK: Slot {} (Relaying to mesh...)", block.slot);
+                                info!("📦 RECEIVED BLOCK: Slot {} (Relaying...)", block.slot);
                                 *h = block.slot;
                                 let _ = net.ledger.lock().unwrap().add_block(block.clone());
                                 net.broadcast_block(block); 
@@ -256,7 +255,7 @@ pub async fn run_p2p_listener_core(run_data: NetworkRunData) -> Result<(), Box<d
                         },
                         _ => {}
                     },
-                    _ => break, // Drop peer on timeout/error
+                    _ => break, 
                 }
             }
         });
@@ -274,6 +273,7 @@ pub async fn run_rpc_server(
     let ledger_blocks = ledger.clone();
     let http_addr: SocketAddr = "0.0.0.0:56001".parse().unwrap();
 
+    // Routes
     let airdrop = warp::path!("airdrop" / String / u64).map(move |addr: String, amt: u64| {
         let mut l = ledger_airdrop.lock().unwrap();
         if l.faucet(&addr, amt).is_ok() {
@@ -301,7 +301,14 @@ pub async fn run_rpc_server(
         warp::reply::json(&recent)
     });
 
-    let routes = airdrop.or(stake).or(blocks);
+    // --- NEW: CORS METHOD ---
+    let cors = warp::cors()
+        .allow_any_origin()
+        .allow_methods(vec!["GET", "POST", "OPTIONS"])
+        .allow_headers(vec!["content-type"]);
+
+    let routes = airdrop.or(stake).or(blocks).with(cors);
+    
     warp::serve(routes).run(http_addr).await;
     Ok(())
 }
