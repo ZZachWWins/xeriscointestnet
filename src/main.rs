@@ -1,4 +1,3 @@
-// [BOTH COMPUTERS] src/main.rs
 use solana_sdk::{pubkey::Pubkey, signature::{Keypair, Signer}};
 use std::error::Error;
 use clap::{Command, Arg};
@@ -7,9 +6,9 @@ use tokio::runtime::Runtime;
 use crate::network::Network;
 use log::{info, error, warn};
 use prometheus::{Gauge, Registry};
-use std::path::Path; // Checking if file exists
-use std::fs::File;   // Creating new files
-use std::io::Write;  // Writing to files
+use std::path::Path; 
+use std::fs::File;   
+use std::io::Write;  
 
 mod pow;
 mod poh;
@@ -19,13 +18,14 @@ mod network;
 mod staking;
 mod explorer;
 mod tx_pool;
+mod merkle;
 
 use crate::ledger::Ledger;
 
 struct Validator {
     keypair: Keypair,
     ledger: Arc<Mutex<Ledger>>,
-    poh_recorder: poh::PoHRecorder,
+    poh_recorder: poh::PoHRecorder, // Now a thread-safe wrapper
     validators: Arc<Mutex<Vec<Pubkey>>>,
     is_bootstrap: bool,
     tx_pool: Arc<Mutex<tx_pool::PriorityQueue>>,
@@ -37,13 +37,15 @@ struct Validator {
 impl Validator {
     fn new(keypair: Keypair, ledger: Arc<Mutex<Ledger>>, tx_pool: Arc<Mutex<tx_pool::PriorityQueue>>, is_bootstrap: bool) -> Self {
         let validators = Arc::new(Mutex::new(vec![keypair.pubkey()]));
-        let poh_recorder = poh::PoHRecorder::new();
+        
+        // --- FIX 1: Create ONE Shared Clock ---
+        let poh_recorder = poh::PoHRecorder::new(); 
 
         let network = Arc::new(Mutex::new(Network::new(
             tx_pool.clone(), 
             validators.clone(), 
             ledger.clone(), 
-            poh_recorder.clone()
+            poh_recorder.clone() // Pass Clone 1 to Network
         )));
 
         let registry = Registry::new();
@@ -61,7 +63,9 @@ impl Validator {
 
         #[allow(unused_mut)] 
         Validator {
-            keypair, ledger, poh_recorder, validators, is_bootstrap, tx_pool, network, registry, block_time_gauge,
+            keypair, ledger, 
+            poh_recorder, // Pass Clone 2 (or original) to Validator
+            validators, is_bootstrap, tx_pool, network, registry, block_time_gauge,
         }
     }
 
@@ -123,13 +127,11 @@ impl Validator {
 
                 match mining_result {
                     Ok(block) => {
-                        // FIX: Handle race condition without crashing
                         let mut ledger = self.ledger.lock().unwrap();
                         if let Err(e) = ledger.add_block(block.clone()) {
                             warn!("Race lost or block error: {}", e);
                         } else {
                             info!("Block proposed and COMMITTED for slot {}", slot);
-                            // Drop ledger lock before broadcasting to prevent deadlock
                             drop(ledger); 
                             self.network.lock().unwrap().broadcast_block(block);
                         }
@@ -137,9 +139,7 @@ impl Validator {
                     Err(_) => { }
                 }
             }
-            // --- CRITICAL FIX: SLOW DOWN BLOCK PRODUCTION ---
-            // Changed from 400ms to 2000ms (2 seconds)
-            // This gives the Mac enough time to download blocks over the internet.
+            // SLOW DOWN BLOCK PRODUCTION
             tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
         }
     }
@@ -157,8 +157,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if matches.get_flag("genesis") { genesis::generate_genesis(&matches); return Ok(()); }
 
     let rt = Runtime::new()?;
-    let poh_recorder = poh::PoHRecorder::new(); 
-
+    
+    // NOTE: We don't create poh_recorder here anymore, it's inside Validator::new
+    
     let result = rt.block_on(async {
         let ledger_path = "ledger.dat".to_string();
         let ledger = Arc::new(Mutex::new(Ledger::new(ledger_path.clone())?));
@@ -172,48 +173,56 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
              
             {
                 let mut l = ledger.lock().unwrap();
-                l.balances.insert(treasury.to_string(), 2_000 * 1_000_000_000); // Fair Launch Amount
+                l.balances.insert(treasury.to_string(), 2_000 * 1_000_000_000); 
             }
              
             let mut validator = Validator::new(keypair, ledger_clone.clone(), tx_pool.clone(), true);
-            let net_fut = network::launch_all_network_services(ledger_clone.clone(), poh_recorder.clone(), tx_pool.clone());
+            // Pass the SHARED recorder from the validator to the services
+            let poh_recorder_ref = validator.poh_recorder.clone(); 
+            
+            let net_fut = network::launch_all_network_services(ledger_clone.clone(), poh_recorder_ref, tx_pool.clone());
              
             if let Err(e) = tokio::try_join!(validator.run(), explorer::start_explorer(ledger_clone.clone()), net_fut) {
                 error!("Crash: {}", e);
             }
         } else if let Some(values) = matches.get_many::<String>("validator") {
             let parts: Vec<String> = values.cloned().collect();
-            let keypair_path = &parts[1]; // Get the path (e.g., "miner.json")
+            let custom_seed_ip = parts[0].clone(); // Capture IP
+            let keypair_path = &parts[1]; 
 
-            // --- AUTO-KEY-GEN LOGIC START ---
+            // --- AUTO-KEY-GEN ---
             let keypair = if Path::new(keypair_path).exists() {
-                // If file exists, load it
                 Keypair::try_from(serde_json::from_slice::<Vec<u8>>(&std::fs::read(keypair_path)?)?.as_slice())?
             } else {
-                // If file is missing, create NEW unique wallet
                 println!("⭐ Miner file '{}' not found. Creating a NEW wallet...", keypair_path);
                 let new_key = Keypair::new();
                 let bytes = new_key.to_bytes().to_vec();
-                let json = serde_json::to_string(&bytes)?; // Save as JSON array
-                
+                let json = serde_json::to_string(&bytes)?; 
                 let mut file = File::create(keypair_path)?;
                 file.write_all(json.as_bytes())?;
-                
                 println!("✅ New wallet saved to '{}'. BACK UP THIS FILE!", keypair_path);
                 new_key
             };
             
-            // --- NEW: SAVE ADDRESS TO FILE (For Windows UX) ---
+            // Save address
             let my_address = keypair.pubkey().to_string();
-            // Just write the address string to "address.txt" next to the exe
             if let Ok(mut file) = File::create("address.txt") {
                 let _ = file.write_all(my_address.as_bytes());
                 println!("📍 Address saved to 'address.txt'. Open this file to copy your address!");
             }
-            // --------------------------------------------------
 
             let mut validator = Validator::new(keypair, ledger_clone.clone(), tx_pool.clone(), false);
-            let net_fut = network::launch_all_network_services(ledger_clone.clone(), poh_recorder.clone(), tx_pool.clone());
+
+            // --- FORCE CONNECT TO CLI SEED ---
+            {
+                println!("Force connecting to CLI seed: {}", custom_seed_ip);
+                let net = validator.network.clone();
+                let seeds = vec![custom_seed_ip];
+                net.lock().unwrap().connect_to_seeds(&seeds);
+            }
+
+            let poh_recorder_ref = validator.poh_recorder.clone();
+            let net_fut = network::launch_all_network_services(ledger_clone.clone(), poh_recorder_ref, tx_pool.clone());
              
             if let Err(e) = tokio::try_join!(validator.run(), explorer::start_explorer(ledger_clone.clone()), net_fut) {
                 error!("Crash: {}", e);

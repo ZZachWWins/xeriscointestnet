@@ -1,3 +1,4 @@
+// src/ledger.rs
 use solana_sdk::{pubkey::Pubkey, transaction::Transaction};
 use serde::{Serialize, Deserialize};
 use std::collections::{HashMap, VecDeque, HashSet}; 
@@ -7,9 +8,10 @@ use sha2::{Sha256, Digest};
 use std::error::Error;
 use crate::poh::PoHRecorder;
 use solana_sdk::system_instruction::SystemInstruction;
+// ADDED: Import merkle
+use crate::merkle;
 
 const LEDGER_FILE: &str = "ledger.dat";
-// CHANGE THIS BACK TO YOUR REAL TOTAL SUPPLY FOR MAINNET (e.g. 100M)
 pub const INITIAL_SUPPLY: u64 = 2_000 * 1_000_000_000; 
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -18,6 +20,7 @@ pub struct Block {
     pub hash: Vec<u8>,
     pub nonce: u64,
     pub transactions: Vec<Transaction>,
+    pub merkle_root: Vec<u8>, // <--- NEW V1.0 FIELD
     pub proposer: Pubkey,
     pub poh_timestamp: u128,
 }
@@ -27,7 +30,6 @@ pub struct Ledger {
     pub blocks: Vec<Block>,
     pub balances: HashMap<String, u64>,
     pub stakes: HashMap<Pubkey, u64>,
-    // NEW: Track transaction signatures to prevent Replay Attacks
     pub processed_signatures: HashSet<String>, 
     pub tx_pool: VecDeque<Transaction>,
     pub liquidity_pools: HashMap<String, LiquidityPool>,
@@ -50,30 +52,44 @@ impl Ledger {
     pub fn new(path: String) -> Result<Self, Box<dyn Error>> {
         if std::path::Path::new(&path).exists() {
             info!("Restoring ledger from {}", path);
-            let bytes = std::fs::read(&path)?;
-            let ledger: Ledger = bincode::deserialize(&bytes)?;
-            Ok(ledger)
+            match std::fs::read(&path) {
+                Ok(bytes) => {
+                    match bincode::deserialize::<Ledger>(&bytes) {
+                        Ok(ledger) => Ok(ledger),
+                        Err(_) => {
+                            warn!("Ledger format mismatch (V1 Upgrade). Creating new ledger.");
+                            // Backup old ledger just in case
+                            std::fs::rename(&path, format!("{}.bak", path))?;
+                            Self::initialize_new(path)
+                        }
+                    }
+                },
+                Err(e) => Err(Box::new(e))
+            }
         } else {
-            info!("Initializing new ledger.");
-            // Bootstrap Key
-            let treasury_pubkey: Pubkey = "8evPjjozSHNcoGRcv7zzxwan9sf3ubJ8q9CFzms6AK97".parse().unwrap_or_default();
-            
-            let mut balances = HashMap::new();
-            balances.insert(treasury_pubkey.to_string(), INITIAL_SUPPLY);
-
-            let ledger = Ledger {
-                blocks: Vec::new(),
-                balances,
-                stakes: HashMap::new(),
-                processed_signatures: HashSet::new(), // Init tracker
-                tx_pool: VecDeque::new(),
-                liquidity_pools: HashMap::new(),
-                treasury: treasury_pubkey,
-                poh_recorder: PoHRecorder::new(),
-            };
-            ledger.save(&path)?;
-            Ok(ledger)
+            Self::initialize_new(path)
         }
+    }
+
+    fn initialize_new(path: String) -> Result<Self, Box<dyn Error>> {
+        info!("Initializing new V1.0 ledger.");
+        let treasury_pubkey: Pubkey = "8evPjjozSHNcoGRcv7zzxwan9sf3ubJ8q9CFzms6AK97".parse().unwrap_or_default();
+        
+        let mut balances = HashMap::new();
+        balances.insert(treasury_pubkey.to_string(), INITIAL_SUPPLY);
+
+        let ledger = Ledger {
+            blocks: Vec::new(),
+            balances,
+            stakes: HashMap::new(),
+            processed_signatures: HashSet::new(),
+            tx_pool: VecDeque::new(),
+            liquidity_pools: HashMap::new(),
+            treasury: treasury_pubkey,
+            poh_recorder: PoHRecorder::new(),
+        };
+        ledger.save(&path)?;
+        Ok(ledger)
     }
 
     pub fn save(&self, path: &str) -> Result<(), Box<dyn Error>> {
@@ -86,25 +102,28 @@ impl Ledger {
         self.blocks.last()
     }
 
-    // --- NEW: Ability to delete the last block (for Re-orgs) ---
     pub fn rollback(&mut self) {
         if let Some(bad_block) = self.blocks.pop() {
             info!("🔄 RE-ORG: Rolled back slot {}", bad_block.slot);
-            // Note: In a full mainnet, you would also revert balances/UTXOs here.
-            // For V1 Alpha, removing the block is enough to sync up.
             let _ = self.save(LEDGER_FILE);
         }
     }
-    // ------------------------------------------------------------
 
     pub fn add_block(&mut self, block: Block) -> Result<(), Box<dyn Error>> {
         if self.detect_malicious(&block) {
             return Err("Malicious block detected (Older Slot)".into());
         }
+
+        // --- NEW SECURITY: Verify Merkle Root ---
+        let calculated_root = merkle::get_merkle_root(&block.transactions);
+        if calculated_root != block.merkle_root {
+            error!("❌ CRITICAL: Merkle Root mismatch! Block integrity failed.");
+            return Err("Invalid Merkle Root".into());
+        }
+        // ----------------------------------------
         
         // --- PROCESS TRANSACTIONS ---
         for (i, tx) in block.transactions.iter().enumerate() {
-            // FIX: Check Replay Protection
             let sig = tx.signatures[0].to_string();
             if self.processed_signatures.contains(&sig) {
                 warn!("Skipping Replay Transaction: {}", sig);
@@ -114,7 +133,6 @@ impl Ledger {
             match self.process_transaction(tx) {
                 Ok(_) => {
                     info!("Transaction {} executed.", i);
-                    // Mark as processed
                     self.processed_signatures.insert(sig);
                 },
                 Err(e) => error!("Transaction {} FAILED: {}", i, e),
@@ -124,7 +142,6 @@ impl Ledger {
         self.blocks.push(block.clone());
         self.save(LEDGER_FILE)?;
 
-        // Apply Rewards (Simpler for V1)
         let reward = 342_500_000_000u64;
         *self.balances.entry(block.proposer.to_string()).or_insert(0u64) += reward;
 
@@ -142,7 +159,6 @@ impl Ledger {
                         let from_idx = ix.accounts[0] as usize;
                         let to_idx = ix.accounts[1] as usize;
 
-                        // Bounds check
                         if from_idx >= accounts.len() || to_idx >= accounts.len() {
                             return Err("Invalid account index".into());
                         }
