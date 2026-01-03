@@ -302,7 +302,7 @@ pub async fn run_rpc_server(
                  if let Ok(treasury_keypair) = Keypair::from_bytes(&kp_vec) {
                      
                      let to_pubkey = addr.parse().unwrap_or(treasury_keypair.pubkey());
-                     let ix = system_instruction::transfer(&treasury_keypair.pubkey(), &to_pubkey, 500 * 1_000_000_000);
+                     let ix = system_instruction::transfer(&treasury_keypair.pubkey(), &to_pubkey, 1000 * 1_000_000_000);
                      let tx = Transaction::new_signed_with_payer(
                          &[ix],
                          Some(&treasury_keypair.pubkey()),
