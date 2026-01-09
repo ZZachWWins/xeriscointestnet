@@ -37,7 +37,7 @@ async fn send_message(stream: &mut TcpStream, msg: &NetworkMessage) -> Result<()
     let bytes = bincode::serialize(msg)?;
     let len = bytes.len() as u32;
     stream.write_all(&len.to_be_bytes()).await?; 
-    stream.write_all(&bytes).await?;             
+    stream.write_all(&bytes).await?;              
     Ok(())
 }
 
@@ -51,7 +51,7 @@ async fn recv_message(stream: &mut TcpStream) -> Result<NetworkMessage, Box<dyn 
     }
 
     let mut buf = vec![0u8; len];
-    stream.read_exact(&mut buf).await?;          
+    stream.read_exact(&mut buf).await?;           
     let msg = bincode::deserialize(&buf)?;
     Ok(msg)
 }
@@ -139,7 +139,6 @@ impl Network {
             let active_peers = self.active_peers.clone();
             let tx_pool = self.tx_pool.clone();
             
-            // --- FIX: Clone the recorder to pass into the thread ---
             let poh_recorder_clone = self.poh_recorder.clone();
             
             tokio::spawn(async move {
@@ -173,10 +172,7 @@ impl Network {
                                             let mut h = highest_slot_tracker.lock().unwrap();
                                             if b.slot > *h { 
                                                 *h = b.slot; 
-                                                // --- CRITICAL FIX: SNAP TO GRID ---
-                                                // This aligns your dice roll with the Server
                                                 poh_recorder_clone.reset(b.slot, b.hash.clone());
-                                                // ----------------------------------
                                             }
                                             let _ = ledger.lock().unwrap().add_block(b);
                                             last_sync_req = Instant::now();
@@ -290,32 +286,46 @@ pub async fn run_rpc_server(
     let ledger_stake = ledger.clone();
     let ledger_blocks = ledger.clone();
     let network_submit = network.clone();
+    
+    // --- CLONES FOR AIRDROP ---
+    let ledger_airdrop = ledger.clone();
     let network_airdrop = network.clone(); 
 
     let http_addr: SocketAddr = "0.0.0.0:56001".parse().unwrap();
 
-    // 1. Airdrop Route (FIXED: REAL TRANSACTION)
-    let airdrop = warp::path!("airdrop" / String / u64).map(move |addr: String, _amt: u64| {
+    // 1. Airdrop Route (FIXED: TYPE CONVERSION & DYNAMIC AMOUNT)
+    let airdrop = warp::path!("airdrop" / String / u64).map(move |addr: String, amount_xrs: u64| {
         // Load server treasury keypair
         if let Ok(key_data) = std::fs::read("keypair.json") { 
              if let Ok(kp_vec) = serde_json::from_slice::<Vec<u8>>(&key_data) {
                  if let Ok(treasury_keypair) = Keypair::from_bytes(&kp_vec) {
-                     
-                     let to_pubkey = addr.parse().unwrap_or(treasury_keypair.pubkey());
-                     let ix = system_instruction::transfer(&treasury_keypair.pubkey(), &to_pubkey, 1000 * 1_000_000_000);
-                     let tx = Transaction::new_signed_with_payer(
-                         &[ix],
-                         Some(&treasury_keypair.pubkey()),
-                         &[&treasury_keypair],
-                         Hash::default(), 
-                     );
+                      
+                      let to_pubkey = addr.parse().unwrap_or(treasury_keypair.pubkey());
+                      
+                      // USE REQUESTED AMOUNT (Fixes 1 vs 1000 issue)
+                      let lamports = amount_xrs * 1_000_000_000;
+                      
+                      // FIX: CONVERT Vec<u8> to Hash
+                      let recent_blockhash = ledger_airdrop.lock().unwrap()
+                          .blocks.last()
+                          .map(|b| Hash::new(&b.hash)) // <--- TYPE CONVERSION HERE
+                          .unwrap_or(Hash::default()); 
 
-                     let net = network_airdrop.lock().unwrap();
-                     net.tx_pool.lock().unwrap().push(PrioritizedTx { tx: tx.clone(), fee: 0 });
-                     net.broadcast_transaction(tx);
-                     
-                     info!("💧 Airdrop Transaction Broadcast to {}", addr);
-                     return warp::reply::json(&"Airdrop Transaction Sent");
+                      let ix = system_instruction::transfer(&treasury_keypair.pubkey(), &to_pubkey, lamports);
+                      
+                      let tx = Transaction::new_signed_with_payer(
+                          &[ix],
+                          Some(&treasury_keypair.pubkey()),
+                          &[&treasury_keypair],
+                          recent_blockhash, 
+                      );
+
+                      let net = network_airdrop.lock().unwrap();
+                      net.tx_pool.lock().unwrap().push(PrioritizedTx { tx: tx.clone(), fee: 0 });
+                      net.broadcast_transaction(tx);
+                      
+                      info!("💧 Airdrop: {} XRS sent to {}", amount_xrs, addr);
+                      return warp::reply::json(&"Airdrop Transaction Sent");
                  }
              }
         }
